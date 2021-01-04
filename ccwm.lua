@@ -12,6 +12,8 @@ local EVENTS_MOUSE = {"mouse_click","mouse_up","mouse_scroll","mouse_drag"}
 local MIN_WIDTH = 4
 local MIN_HEIGHT = 3
 
+local SHADOW_ENABLE = false
+
 local term_original = term.current()
 
 local default_width = 20
@@ -24,6 +26,7 @@ DRAG_RESIZE = 1
 
 local draw_background = false
 
+local multishell_ext = {}
 
 local function str_pad(str, length)
 	if #str > length then
@@ -43,6 +46,13 @@ local function contains(arr, elem)
 	return false
 end
 
+local function table_copy(tbl)
+	local copy = {}
+	for k,v in pairs(tbl) do
+		copy[k] = v
+	end
+	return copy
+end
 
 local function process_subwindow_properties(id)
 	local process = processes[id]
@@ -101,8 +111,13 @@ local function process_resume(id, args)
 	term.redirect(term_original)
 end
 
+-- base process constructor
+-- runs an arbitrary function inside a process
 local function process_create(func, title, x, y, w, h)
 	local process = {}
+	
+	local current_run = process_current
+	
 	table.insert(processes, process)
 	
 	process.coroutine = coroutine.create(func)
@@ -116,13 +131,48 @@ local function process_create(func, title, x, y, w, h)
 	process.title = title
 	process.dirty = 2
 	process.filter = nil
+	process.maximized = false
+	process.old_pos = {}
 	
 	px,py,pw,ph = process_subwindow_properties(#processes)
 	process.window = window.create(term_original,px,py,pw,ph,true)
 	
 	process_resume(#processes,{})
 	
+	if current_run > 0 then
+		process_current = current_run
+		processes[current_run].window.restoreCursor()
+		term.redirect(processes[current_run].window)
+	end
+	
 	return #processes
+end
+
+-- wraps an os.run call inside a process
+local function process_run(env, path, args, title, x, y, w, h)
+	run_args = {}
+	table.insert(run_args, env)
+	table.insert(run_args, path)
+	for i=1,#args do
+		table.insert(run_args,args[i])
+	end
+	title = title or path
+	return process_create(function() os.run(unpack(run_args)) end, title, x, y, w, h)
+end
+
+-- runs a shell command inside a process,
+-- and lets the CraftOS shell set up the environment
+-- is this hacky? maybe
+-- it does seem to work though
+local function process_run_command(command, x, y, w, h)
+	-- not sure if i'm doing this right, honestly
+	-- seems to work though
+	
+	--if not env then
+	env = {shell=shell, multishell=multishell_ext} --table_copy(_G)
+	--end
+	
+	process_run(env, shell.resolveProgram("shell"), {command}, command, x, y, w, h)
 end
 
 local function process_reposition(id, x, y, w, h)
@@ -159,10 +209,27 @@ local function process_set_visible(id, visible)
 	wm_dirty()
 end
 
-local function process_run(command, x, y, w, h)
-	-- TODO: try os.run, create custom environment
-	-- Override shell and multishell APIs to provide custom window titles, other features
-	process_create(function() shell.run(command) end, command, x, y, w, h)
+local function process_set_title(id, title)
+	local process = processes[id]
+	process.title = title
+	wm_dirty(id)
+end
+
+local function process_set_maximized(id, maximized)
+	local process = processes[id]
+	process.maximized = maximized
+	if maximized then
+		process.old_pos.x = process.x
+		process.old_pos.y = process.y
+		process.old_pos.w = process.w
+		process.old_pos.h = process.h
+		w,h = term.getSize()
+		process_reposition(id,1,1,w,h)
+	else
+		process_reposition(id,
+			process.old_pos.x,process.old_pos.y,
+			process.old_pos.w,process.old_pos.h)
+	end
 end
 
 local function process_set_focus(id, top)
@@ -190,32 +257,51 @@ local function process_draw(id)
 	-- Current implementation can cover information (e.g. CC edit line number)
 	local process = processes[id]
 	if process.visible and process.dirty > 0 then
-		local title_color = colors.gray
-		if id == process_focus then
-			title_color = colors.blue
-		end
-		term.setBackgroundColor(title_color)
-		term.setTextColor(colors.white)
-		term.setCursorPos(process.x, process.y)
-		term.write(str_pad(process.title,process.w-3))
-		term.setBackgroundColor(colors.white)
-		term.setTextColor(title_color)
-		term.write(string.char(22,23))
-		term.setBackgroundColor(colors.red)
-		term.setTextColor(colors.white)
-		term.write("x")
 		if process.dirty == 2 then
 			process.window.redraw()
 		end
-		term.setCursorPos(process.x+process.w-1,process.y+process.h-1)
-		term.setBackgroundColor(colors.white)
-		term.setTextColor(colors.lightGray)
-		term.write(string.char(127))
+		if SHADOW_ENABLE then
+			term.setBackgroundColor(colors.gray)
+			for i=1,process.w do
+				term.setCursorPos(process.x+i,process.y+process.h)
+				term.write(" ")
+			end
+			for i=1,process.h-1 do
+				term.setCursorPos(process.x+process.w,process.y+i)
+				term.write(" ")
+			end
+		end
+		if process.border then
+			local title_color = colors.gray
+			if id == process_focus then
+				title_color = colors.blue
+			end
+			
+			term.setBackgroundColor(title_color)
+			term.setTextColor(colors.white)
+			term.setCursorPos(process.x, process.y)
+			term.write(str_pad(process.title,process.w-3))
+			
+			term.setBackgroundColor(colors.white)
+			term.setTextColor(title_color)
+			term.write(string.char(22,23))
+			
+			term.setBackgroundColor(colors.red)
+			term.setTextColor(colors.white)
+			term.write("x")
+			
+			if not process.maximized then
+				term.setCursorPos(process.x+process.w-1,process.y+process.h-1)
+				term.setBackgroundColor(colors.white)
+				term.setTextColor(colors.lightGray)
+				term.write(string.char(127))
+			end
+		end
 		process.dirty = 0
 	end
 end
 
--- return true to block event from the process
+-- return true to block click event from the process
 local function wm_handle_window_click(id, event)
 	local process = processes[id]
 	if not process.border then return false end
@@ -225,11 +311,14 @@ local function wm_handle_window_click(id, event)
 				-- close
 				process_end(id)
 			elseif event[3] == process.x + process.w - 2 then
-				-- TODO: maximize
+				-- maximize
+				process_set_maximized(id, not process.maximized)
 			elseif event[3] == process.x + process.w - 3 then
+				-- minimize
 				-- TODO: add a way to restore minimized windows
+				-- currently they are lost to the void
 				process_set_visible(id, false)
-			else
+			elseif not process.maximized then
 				drag_state = {}
 				drag_state.id = id
 				drag_state.mode = DRAG_MOVE
@@ -237,7 +326,7 @@ local function wm_handle_window_click(id, event)
 			end
 		end
 		return true
-	elseif event[4] == process.y+process.h-1 then
+	elseif event[4] == process.y+process.h-1 and not process.maximized then
 		if event[3] == process.x+process.w-1 then
 			drag_state = {}
 			drag_state.id = id
@@ -324,7 +413,7 @@ local function wm_handle_mouse_event(event)
 		end
 	end
 	if (not hit_window) and event[1] == "mouse_click" then
-		process_run("shell",event[3],event[4])
+		process_run_command(nil,event[3],event[4])
 		--wm_draw()
 	end
 end
@@ -336,6 +425,12 @@ local function wm_handle_event(event)
 	-- this is only needed if running a copy of the WM inside itself
 	-- doing such a thing is so unbelievably silly that i had no choice but to support it
 	if event[1] == "term_resize" then
+		w,h = term.getSize()
+		for i=1,#processes do
+			if processes[i].maximized then
+				process_reposition(i,1,1,w,h)
+			end
+		end
 		wm_dirty()
 	end
 	
@@ -389,8 +484,22 @@ local function wm_mainloop()
 	end
 end
 
-process_run("shell",10,2)
+-- Multishell extensions to provide proper windowing functionality to programs
+multishell_ext.getFocus = function() return process_focus end
+multishell_ext.setFocus = function(n) process_set_focus(n) end
+multishell_ext.getTitle = function(n) return processes[n].getTitle() end
+multishell_ext.setTitle = function(n, title) process_set_title(n, title) end
+multishell_ext.getCurrent = function() return process_current end
+multishell_ext.getCount = function() return #processes end
+multishell_ext.launch = function(tProgramEnv, sProgramPath, ...)
+	return process_run(tProgramEnv, sProgramPath, {...})
+end
+
+
+process_run_command(nil)
 process_set_focus(1)
+--processes[1].border = false
+--process_reposition(1,5,5)
 wm_mainloop()
 
 term.setBackgroundColor(colors.black)

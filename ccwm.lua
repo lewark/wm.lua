@@ -1,4 +1,5 @@
 local processes = {}
+local processes_visible = {}
 local process_focus = 0
 local process_current = 0
 
@@ -26,6 +27,8 @@ DRAG_RESIZE = 1
 
 local draw_background = false
 
+local control_held = false
+
 local multishell_ext = {}
 
 -- BUG: textutils.pagedPrint seems broken
@@ -46,6 +49,15 @@ local function contains(arr, elem)
 		end
 	end
 	return false
+end
+
+local function index(arr, elem)
+	for k, v in pairs(arr) do
+		if v == elem then
+			return k
+		end
+	end
+	return nil
 end
 
 local function table_copy(tbl)
@@ -73,27 +85,44 @@ end
 local function wm_dirty(id,force)
 	if id then
 		local process = processes[id]
+		local layer = index(processes_visible,id)
 		if force then
 			process.dirty = 2
 		elseif process.dirty == 0 then
 			process.dirty = 1
 		end
-		for i=id+1,#processes do
-			processes[i].dirty = 2
+		if layer then
+			for i=layer+1,#processes_visible do
+				processes[processes_visible[i]].dirty = 2
+			end
 		end
 	else
 		draw_background = true
-		for i=1,#processes do
-			processes[i].dirty = 2
+		for i=1,#processes_visible do
+			processes[processes_visible[i]].dirty = 2
 		end
 	end
 end
 
 local function process_end(id)
 	table.remove(processes, id)
-	if process_focus > #processes then
-		process_focus = #processes
+	if process_focus == id then
+		process_focus = 0
+	elseif process_focus > id then
+		process_focus = process_focus - 1
 	end
+	
+	local i = index(processes_visible, id)
+	if i then
+		table.remove(processes_visible, i)
+	end
+	
+	for i=1,#processes_visible do
+		if processes_visible[i] > id then
+			processes_visible[i] = processes_visible[i] - 1
+		end
+	end
+	
 	wm_dirty()
 end
 
@@ -116,6 +145,7 @@ local function process_resume(id, args)
 	if coroutine.status(process.coroutine) == "dead" then --not status then --
 		process_end(id)
 	else
+		wm_log("dirty in resume")
 		wm_dirty(id)
 	end
 	if current_run > 0 then
@@ -144,6 +174,7 @@ local function process_create(func, title, x, y, w, h)
 	
 	--wm_log("process create")
 	table.insert(processes, process)
+	table.insert(processes_visible, #processes)
 	
 	process.x = x or 4
 	process.y = y or 4
@@ -161,6 +192,7 @@ local function process_create(func, title, x, y, w, h)
 	process.window = window.create(term_original,px,py,pw,ph,true)
 	
 	process_current = #processes
+	
 	process.coroutine = coroutine.create(func)
 	
 	process_current = current_run
@@ -225,7 +257,7 @@ local function process_reposition(id, x, y, w, h)
 	process.w = w
 	process.h = h
 	
-	px,py,pw,ph = process_subwindow_properties(#processes)
+	px,py,pw,ph = process_subwindow_properties(id)
 	process.window.reposition(px,py,pw,ph)
 	
 	if resized then
@@ -239,6 +271,16 @@ local function process_set_visible(id, visible)
 	local process = processes[id]
 	process.visible = visible
 	process.window.setVisible(visible)
+	if visible then
+		if not contains(processes_visible, id) then
+			table.insert(processes_visible, id)
+		end
+	else
+		local i = index(processes_visible, id)
+		if i then
+			table.remove(processes_visible, i)
+		end
+	end
 	wm_dirty()
 end
 
@@ -265,22 +307,32 @@ local function process_set_maximized(id, maximized)
 	end
 end
 
+-- BUG: function does not handle previously focused window closing
+-- TODO: switch to using an event queue to fix concurrency problems
 local function process_set_focus(id, top)
+	--wm_log("visible "..table.concat(processes_visible,","))
+	--wm_log("n "..#processes)
 	if process_focus > 0 and process_focus ~= id then
-		wm_dirty(process_focus)
-		process_resume(process_focus,{"wm_focus",0})
+		local old_focus = process_focus
+		process_focus = 0
+		wm_dirty(old_focus)
+		process_resume(old_focus,{"wm_focus",0})
 	end
 	if top then
 		-- move the window to the top
-		-- TODO: decouple process ID from window layering
 		local process = processes[id]
-		table.remove(processes,id)
-		table.insert(processes,process)
-		if process_focus ~= id then
-			process_focus = #processes
-			process_resume(process_focus,{"wm_focus",1})
+		
+		local i = index(processes_visible, id)
+		if i then
+			table.remove(processes_visible, i)
 		end
-		wm_dirty(process_focus,true)
+		table.insert(processes_visible,id)
+		
+		if process_focus ~= id then
+			process_focus = id
+			process_resume(process_focus,{"wm_focus",1})
+			wm_dirty(process_focus,true)
+		end
 	elseif process_focus ~= id then
 		process_focus = id
 		if process_focus > 0 then
@@ -543,49 +595,46 @@ local function wm_handle_mouse_event(event)
 	end
 	
 	local hit_window = false
-	if #processes > 0 then
-		for i=#processes,1,-1 do
-			local process = processes[i]
-			--term.setTextColor(colors.black)
-			--print(process.x)
-			-- event within window borders?
+	for i=#processes_visible,1,-1 do
+		local id = processes_visible[i]
+		local process = processes[id]
+		--term.setTextColor(colors.black)
+		--print(process.x)
+		-- event within window borders?
+		
+		if (process.visible and
+			event[3] >= process.x and 
+			event[4] >= process.y and 
+			event[3] < process.x+process.w and
+			event[4] < process.y+process.h) then
 			
-			if (process.visible and
-				event[3] >= process.x and 
-				event[4] >= process.y and 
-				event[3] < process.x+process.w and
-				event[4] < process.y+process.h) then
-				
-				hit_window = true
-				x,y,w,h = process_subwindow_properties(i)
-				
-				local new_id = i
-				local skip = false
-				
-				if event[1] == "mouse_click" then
-					process_set_focus(i,true)
-					local new_id = #processes
-					skip = wm_handle_window_click(new_id, event)
-				end
-				
-				-- event within window contents?
-				if ((not skip) and
-					event[3] >= x and 
-					event[4] >= y and 
-					event[3] < x+w and
-					event[4] < y+h) then
-					
-					event[3] = event[3] - x + 1
-					event[4] = event[4] - y + 1
-					process_resume(new_id,event)
-				end
-				
-				break
+			hit_window = true
+			x,y,w,h = process_subwindow_properties(i)
+			
+			local skip = false
+			
+			if event[1] == "mouse_click" then
+				process_set_focus(id,true)
+				skip = wm_handle_window_click(id, event)
 			end
+			
+			-- event within window contents?
+			if ((not skip) and
+				event[3] >= x and 
+				event[4] >= y and 
+				event[3] < x+w and
+				event[4] < y+h) then
+				
+				event[3] = event[3] - x + 1
+				event[4] = event[4] - y + 1
+				process_resume(id,event)
+			end
+			
+			break
 		end
 	end
 	if (not hit_window) and event[1] == "mouse_click" then
-		wm_log("desktop clicked")
+		--wm_log("desktop clicked")
 		if event[2] == 2 then
 			--process_run_command(nil,event[3],event[4])
 			local options = {}
@@ -621,7 +670,27 @@ local function wm_handle_event(event)
 	if is_mouse then
 		wm_handle_mouse_event(event)
 	elseif is_keybd then
-		if process_focus > 0 then
+		local block = false
+		if event[1] == "key" then
+			if event[2] == keys.leftCtrl then
+				control_held = true
+			elseif event[2] == keys.tab and control_held then
+				block = true
+				if #processes > 0 then
+					local new_focus = process_focus + 1
+					if new_focus > #processes then
+						new_focus = 1
+					end
+					process_set_visible(new_focus,true)
+					process_set_focus(new_focus,true)
+				end
+			end
+		elseif event[1] == "key_up" then
+			if event[2] == keys.leftCtrl then
+				control_held = false
+			end
+		end
+		if (not block) and process_focus > 0 then
 			process_resume(process_focus,event)
 		end
 	else
@@ -643,8 +712,8 @@ local function wm_draw()
 		draw_background = false
 	end
 		
-	for i=1,#processes do
-		process_draw(i)
+	for i=1,#processes_visible do
+		process_draw(processes_visible[i])
 	end
 	if process_focus > 0 then
 		processes[process_focus].window.restoreCursor()
@@ -681,7 +750,7 @@ end
 
 
 process_run_command("logview")
-process_run_command(nil)
+--process_run_command(nil)
 process_set_focus(1)
 --processes[1].border = false
 --process_reposition(1,5,5)

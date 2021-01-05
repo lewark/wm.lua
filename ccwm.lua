@@ -28,6 +28,8 @@ local draw_background = false
 
 local multishell_ext = {}
 
+-- BUG: textutils.pagedPrint seems broken
+
 local function str_pad(str, length)
 	if #str > length then
 		str = string.sub(str,1,length)
@@ -95,20 +97,42 @@ local function process_end(id)
 	wm_dirty()
 end
 
+local function wm_log(text) end
+
 local function process_resume(id, args)
 	local process = processes[id]
+	local current_run = process_current
+	if not process.coroutine then return end
 	if process.filter and args[1] ~= process.filter and args[1] ~= "terminate" then return end
 	process_current = id
 	term.redirect(process.window)
-	local status
-	status, process.filter = coroutine.resume(process.coroutine, unpack(args))
+	local status, ret = coroutine.resume(process.coroutine, unpack(args))
+	--if status then
+		process.filter = ret
+	--else
+	--	wm_log("end "..ret)
+	--end
+	--wm_log("process_resume "..tostring(id).." "..tostring(status).." "..tostring(ret))
 	if coroutine.status(process.coroutine) == "dead" then --not status then --
 		process_end(id)
 	else
 		wm_dirty(id)
 	end
-	process_current = 0
-	term.redirect(term_original)
+	if current_run > 0 then
+		process_current = current_run
+		processes[current_run].window.restoreCursor()
+		term.redirect(processes[current_run].window)
+	else
+		process_current = 0
+		term.redirect(term_original)
+	end
+end
+
+local function wm_log(text)
+	local event = {"wm_log",text}
+	for i=#processes,1,-1 do
+		process_resume(i,event)
+	end
 end
 
 -- base process constructor
@@ -118,9 +142,8 @@ local function process_create(func, title, x, y, w, h)
 	
 	local current_run = process_current
 	
+	--wm_log("process create")
 	table.insert(processes, process)
-	
-	process.coroutine = coroutine.create(func)
 	
 	process.x = x or 4
 	process.y = y or 4
@@ -137,7 +160,17 @@ local function process_create(func, title, x, y, w, h)
 	px,py,pw,ph = process_subwindow_properties(#processes)
 	process.window = window.create(term_original,px,py,pw,ph,true)
 	
-	process_resume(#processes,{})
+	process_current = #processes
+	process.coroutine = coroutine.create(func)
+	
+	process_current = current_run
+	if process.coroutine then
+		--wm_dirty(#processes,true)
+		--wm_log("process resume")
+		process_resume(#processes,{})
+	else
+		process_end(#processes)
+	end
 	
 	if current_run > 0 then
 		process_current = current_run
@@ -233,8 +266,9 @@ local function process_set_maximized(id, maximized)
 end
 
 local function process_set_focus(id, top)
-	if process_focus > 0 then
+	if process_focus > 0 and process_focus ~= id then
 		wm_dirty(process_focus)
+		process_resume(process_focus,{"wm_focus",0})
 	end
 	if top then
 		-- move the window to the top
@@ -242,11 +276,17 @@ local function process_set_focus(id, top)
 		local process = processes[id]
 		table.remove(processes,id)
 		table.insert(processes,process)
-		process_focus = #processes
+		if process_focus ~= id then
+			process_focus = #processes
+			process_resume(process_focus,{"wm_focus",1})
+		end
 		wm_dirty(process_focus,true)
-	else
+	elseif process_focus ~= id then
 		process_focus = id
-		wm_dirty(process_focus)
+		if process_focus > 0 then
+			process_resume(process_focus,{"wm_focus",1})
+			wm_dirty(process_focus)
+		end
 	end
 end
 
@@ -299,6 +339,138 @@ local function process_draw(id)
 		end
 		process.dirty = 0
 	end
+end
+
+-- BUG: menus glitch out if right-click is performed multiple times in a row
+local function show_menu(items)
+	--wm_log("enter show_menu")
+	local process = processes[process_current]
+	process_set_focus(process_current)
+	
+	local x = process.x
+	local y = process.y
+	local w = 0
+	local h = #items
+	--wm_log("x:"..x..",y:"..y..",w:"..w..",h:"..h)
+	for i=1,#items do
+		--wm_log("i:"..i)
+		w = math.max(w, #items[i])
+	end
+	--wm_log("x:"..x..",y:"..y..",w:"..w..",h:"..h)
+	
+	local tw, th = term_original.getSize()
+	
+	if h > th then
+		y = 1
+		h = th
+	elseif y + h > th then
+		y = - h + th + 1
+		if y < 1 then
+			y = 0
+			h = th
+		end
+	end
+	if x + w > tw then
+		x = - w + tw + 1
+	end
+	--wm_log("process "..tostring(process_current).." "..tostring(process))
+	process.border = false
+	--process.x,process.y,process.w,process.h = x,y,w,h
+	--process.window.reposition(x,y,w,h)
+	process_reposition(process_current,x,y,w,h)
+	local selected = 0
+	local scroll = 0
+	local scroll_min = 0
+	local scroll_max = #items-h
+	while true do
+		--wm_log("show_menu loop")
+		term.setBackgroundColor(colors.white)
+		term.setTextColor(colors.black)
+		term.clear()
+		for i=1,#items do
+			term.setCursorPos(1,i-scroll)
+			if selected == i then
+				term.setBackgroundColor(colors.blue)
+				term.setTextColor(colors.white)
+				term.clearLine()
+			else
+				term.setBackgroundColor(colors.white)
+				term.setTextColor(colors.black)
+			end
+			term.write(items[i])
+		end
+		event = {os.pullEvent()}
+		if event[1] == "key" then
+			--local key_name = "blah" --keys.getKey(event[2])
+			--wm_log("menu_key "..tostring(event[2]))
+			if event[2] == keys.up then
+				selected = math.max(selected-1, 1)
+			elseif event[2] == keys.down then
+				selected = math.min(selected+1, #items)
+			elseif (event[2] == keys.enter or
+					event[2] == keys.space) then
+				break
+			end
+		elseif event[1] == "mouse_click" or event[1] == "mouse_drag" then
+			selected = event[4]+scroll
+		elseif event[1] == "mouse_up" then
+			if selected > 0 then break end
+		elseif event[1] == "mouse_scroll" then
+			scroll = math.min(math.max(scroll + event[2],scroll_min),scroll_max)
+		elseif event[1] == "wm_focus" and event[2] == 0 then
+			break
+		end
+		local scroll_shift = 0
+		if selected == scroll + 1 then
+			scroll_shift = -1
+		elseif selected == scroll + h then
+			scroll_shift = 1
+		end
+		scroll = math.min(math.max(scroll + scroll_shift,scroll_min),scroll_max)
+	end
+	if selected > 0 and selected <= #items then
+		return selected, items[i]
+	else
+		return 0, nil
+	end
+end
+
+local function show_run_menu()
+	local options = {"open shell","programs...","run...","shutdown","restart"}
+	local process = processes[process_current]
+	local ret = {pcall(show_menu,options)}
+	--process_reposition(process_current,1,1,10,10)
+	print(ret[1],ret[2])
+	if ret[1] then
+		if ret[2] == 1 then
+			process_run_command(nil,process.x,process.y)
+		elseif ret[2] == 2 then
+			local progs = shell.programs()
+			local ret2 = {pcall(show_menu,progs)}
+			if ret2[1] then
+				--print(ret2[3])
+				process_run_command(progs[ret2[2]],process.x,process.y)
+			end
+		elseif ret[2] == 3 then
+			process.border = true
+			process_reposition(process_current,process.x,process.y,20,4)
+			process_set_title(process_current,"run")
+			term.setBackgroundColor(colors.black)
+			term.setTextColor(colors.white)
+			term.setCursorPos(2,2)
+			term.clear()
+			term.write("run> ")
+			local cmd = read()
+			if cmd then
+				process_run_command(cmd,process.x,process.y)
+			end
+		elseif ret[2] == 4 then
+			os.shutdown()
+		elseif ret[2] == 5 then
+			os.reboot()
+		end
+	end
+	--read()
 end
 
 -- return true to block click event from the process
@@ -413,8 +585,20 @@ local function wm_handle_mouse_event(event)
 		end
 	end
 	if (not hit_window) and event[1] == "mouse_click" then
-		process_run_command(nil,event[3],event[4])
-		--wm_draw()
+		wm_log("desktop clicked")
+		if event[2] == 2 then
+			--process_run_command(nil,event[3],event[4])
+			local options = {}
+			for i=1,30 do
+				table.insert(options, "Option "..i)
+			end
+			--term.setCursorPos(1,1)
+			--print(options)
+			process_create(show_run_menu, "menu", event[3], event[4])
+			--wm_dirty()
+		elseif process_focus > 0 then
+			process_set_focus(0)
+		end
 	end
 end
 
@@ -441,7 +625,7 @@ local function wm_handle_event(event)
 			process_resume(process_focus,event)
 		end
 	else
-		for i=1,#processes do
+		for i=#processes,1,-1 do
 			process_resume(i,event)
 		end
 	end
@@ -496,6 +680,7 @@ multishell_ext.launch = function(tProgramEnv, sProgramPath, ...)
 end
 
 
+process_run_command("logview")
 process_run_command(nil)
 process_set_focus(1)
 --processes[1].border = false

@@ -1,5 +1,35 @@
+-- CCWM: graphical window manager for ComputerCraft
+
+-- Usage:
+--   Right-click the desktop to open the run menu.
+--   Windows work as you'd expect: Drag the title bar of a window to move it,
+--     and click the buttons to minimize, maximize, or close the window. Wowee.
+--   Drag the lower-right corner a window to resize it.
+--   Press Ctrl-Tab to switch windows. This can also restore minimized windows.
+
+-- Notes for application development:
+--   Events not emitted by the mouse or keyboard, such as timers or rednet
+--     messages, are redirected by the WM to all running programs.
+--   If your application uses timers, make sure to check IDs of received timer
+--     events to avoid conflicts with other running applications' timers.
+--   If your application is dependent on the window size, then you can listen
+--     for term_resize events and adjust the UI accordingly.
+--   Additionally, the WM provides a modified multishell API that allows
+--     applications to open additional windows as needed. The API should work
+--     seamlessly with existing multishell applications. shell.openTab
+--     and related library functions also work.
+
+--   The following events are emitted by the window manager:
+--     wm_focus <focused>
+--       emitted when a window gains or loses focus
+--     wm_log <message>
+--       internal debug messages from the WM
+--     term_resize
+--       emitted when a window is resized
+
 local processes = {}
 local processes_visible = {}
+local event_queue = {}
 local process_focus = 0
 local process_current = 0
 
@@ -31,7 +61,11 @@ local control_held = false
 
 local multishell_ext = {}
 
--- BUG: textutils.pagedPrint seems broken
+-- BUG: textutils.pagedPrint seems broken, investigate
+
+local function queue_event(id, evt)
+	table.insert(event_queue, 1, {id, evt})
+end
 
 local function str_pad(str, length)
 	if #str > length then
@@ -76,12 +110,12 @@ local function process_subwindow_properties(id)
 	return process.x, process.y, process.w, process.h
 end
 
--- schedules a redraw
+-- schedules a redraw of the window manager
 -- (no arguments): redraw everything
 -- (id): redraw border of specified window, as well as border
 --       and contents of all windows above it
 -- (id, force): same as id, except if force is true then also
---       redraw contents of the specified window
+--       redraw the contents of the specified window
 local function wm_dirty(id,force)
 	if id then
 		local process = processes[id]
@@ -123,6 +157,15 @@ local function process_end(id)
 		end
 	end
 	
+	for i=#event_queue,1,-1 do
+		local evt = event_queue[i]
+		if evt[1] > id then
+			evt[1] = evt[1] - 1
+		elseif evt[1] == id then
+			table.remove(event_queue,i)
+		end
+	end
+	
 	wm_dirty()
 end
 
@@ -131,23 +174,27 @@ local function wm_log(text) end
 local function process_resume(id, args)
 	local process = processes[id]
 	local current_run = process_current
+	
 	if not process.coroutine then return end
 	if process.filter and args[1] ~= process.filter and args[1] ~= "terminate" then return end
+	
 	process_current = id
 	term.redirect(process.window)
 	local status, ret = coroutine.resume(process.coroutine, unpack(args))
 	--if status then
-		process.filter = ret
+	process.filter = ret
 	--else
 	--	wm_log("end "..ret)
 	--end
 	--wm_log("process_resume "..tostring(id).." "..tostring(status).." "..tostring(ret))
+	
 	if coroutine.status(process.coroutine) == "dead" then --not status then --
 		process_end(id)
 	else
-		wm_log("dirty in resume")
+		--wm_log("dirty in resume")
 		wm_dirty(id)
 	end
+	
 	if current_run > 0 then
 		process_current = current_run
 		processes[current_run].window.restoreCursor()
@@ -161,7 +208,7 @@ end
 local function wm_log(text)
 	local event = {"wm_log",text}
 	for i=#processes,1,-1 do
-		process_resume(i,event)
+		queue_event(i,event)
 	end
 end
 
@@ -199,6 +246,9 @@ local function process_create(func, title, x, y, w, h)
 	if process.coroutine then
 		--wm_dirty(#processes,true)
 		--wm_log("process resume")
+		
+		-- initial resume call must not be queued, the edit program's
+		-- run button expects the process to immediately start
 		process_resume(#processes,{})
 	else
 		process_end(#processes)
@@ -222,13 +272,17 @@ local function process_run(env, path, args, title, x, y, w, h)
 		table.insert(run_args,args[i])
 	end
 	title = title or path
+	--wm_log("run_path "..path)
+	--wm_log("run_args "..table.concat(args," "))
+	
+	-- add a call to read() in the function to debug errors
 	return process_create(function() os.run(unpack(run_args)) end, title, x, y, w, h)
 end
 
 -- runs a shell command inside a process,
 -- and lets the CraftOS shell set up the environment
--- is this hacky? maybe
--- it does seem to work though
+-- is this hacky? maybe. it does seem to work though.
+-- if command is nil then an interactive shell is launched
 local function process_run_command(command, x, y, w, h)
 	-- not sure if i'm doing this right, honestly
 	-- seems to work though
@@ -261,7 +315,7 @@ local function process_reposition(id, x, y, w, h)
 	process.window.reposition(px,py,pw,ph)
 	
 	if resized then
-		process_resume(id, {"term_resize"})
+		queue_event(id, {"term_resize"})
 	end
 	--wm_draw()
 	wm_dirty()
@@ -307,8 +361,6 @@ local function process_set_maximized(id, maximized)
 	end
 end
 
--- BUG: function does not handle previously focused window closing
--- TODO: switch to using an event queue to fix concurrency problems
 local function process_set_focus(id, top)
 	--wm_log("visible "..table.concat(processes_visible,","))
 	--wm_log("n "..#processes)
@@ -316,7 +368,7 @@ local function process_set_focus(id, top)
 		local old_focus = process_focus
 		process_focus = 0
 		wm_dirty(old_focus)
-		process_resume(old_focus,{"wm_focus",0})
+		queue_event(old_focus,{"wm_focus",0})
 	end
 	if top then
 		-- move the window to the top
@@ -330,13 +382,13 @@ local function process_set_focus(id, top)
 		
 		if process_focus ~= id then
 			process_focus = id
-			process_resume(process_focus,{"wm_focus",1})
+			queue_event(process_focus,{"wm_focus",1})
 			wm_dirty(process_focus,true)
 		end
 	elseif process_focus ~= id then
 		process_focus = id
 		if process_focus > 0 then
-			process_resume(process_focus,{"wm_focus",1})
+			queue_event(process_focus,{"wm_focus",1})
 			wm_dirty(process_focus)
 		end
 	end
@@ -393,7 +445,6 @@ local function process_draw(id)
 	end
 end
 
--- BUG: menus glitch out if right-click is performed multiple times in a row
 local function show_menu(items)
 	--wm_log("enter show_menu")
 	local process = processes[process_current]
@@ -488,7 +539,7 @@ local function show_menu(items)
 end
 
 local function show_run_menu()
-	local options = {"open shell","programs...","run...","shutdown","restart"}
+	local options = {"shell","programs...","run...","shutdown","restart"}
 	local process = processes[process_current]
 	local ret = {pcall(show_menu,options)}
 	--process_reposition(process_current,1,1,10,10)
@@ -499,7 +550,7 @@ local function show_run_menu()
 		elseif ret[2] == 2 then
 			local progs = shell.programs()
 			local ret2 = {pcall(show_menu,progs)}
-			if ret2[1] then
+			if ret2[1] and ret2[2] > 0 then
 				--print(ret2[3])
 				process_run_command(progs[ret2[2]],process.x,process.y)
 			end
@@ -512,7 +563,7 @@ local function show_run_menu()
 			term.setCursorPos(2,2)
 			term.clear()
 			term.write("run> ")
-			local cmd = read()
+			local cmd = read(nil,nil,shell.complete)
 			if cmd then
 				process_run_command(cmd,process.x,process.y)
 			end
@@ -539,8 +590,6 @@ local function wm_handle_window_click(id, event)
 				process_set_maximized(id, not process.maximized)
 			elseif event[3] == process.x + process.w - 3 then
 				-- minimize
-				-- TODO: add a way to restore minimized windows
-				-- currently they are lost to the void
 				process_set_visible(id, false)
 			elseif not process.maximized then
 				drag_state = {}
@@ -561,14 +610,7 @@ local function wm_handle_window_click(id, event)
 	return false
 end
 
-local function wm_handle_mouse_event(event)
-	-- TODO: Handle positional events properly
-	-- Send to window below event, change focus if other window clicked
-	-- If title bar of window clicked, close, minimize, maximize, or start drag
-	-- If lower-right corner clicked, resize
-	
-	-- BUG: Switching focus sends initial click event to wrong window
-	
+local function wm_handle_mouse_event(event)	
 	if drag_state then
 		if event[1] == "mouse_up" then
 			drag_state = nil
@@ -609,13 +651,14 @@ local function wm_handle_mouse_event(event)
 			event[4] < process.y+process.h) then
 			
 			hit_window = true
-			x,y,w,h = process_subwindow_properties(i)
+			local x,y,w,h = process_subwindow_properties(id)
 			
 			local skip = false
 			
 			if event[1] == "mouse_click" then
 				process_set_focus(id,true)
 				skip = wm_handle_window_click(id, event)
+				--if skip then wm_log("skipped") end
 			end
 			
 			-- event within window contents?
@@ -625,9 +668,10 @@ local function wm_handle_mouse_event(event)
 				event[3] < x+w and
 				event[4] < y+h) then
 				
-				event[3] = event[3] - x + 1
-				event[4] = event[4] - y + 1
-				process_resume(id,event)
+				local proc_event = table_copy(event)
+				proc_event[3] = proc_event[3] - x + 1
+				proc_event[4] = proc_event[4] - y + 1
+				queue_event(id,proc_event)
 			end
 			
 			break
@@ -691,21 +735,17 @@ local function wm_handle_event(event)
 			end
 		end
 		if (not block) and process_focus > 0 then
-			process_resume(process_focus,event)
+			queue_event(process_focus,event)
 		end
 	else
 		for i=#processes,1,-1 do
-			process_resume(i,event)
+			queue_event(i,event)
 		end
 	end
 end
 
 -- draw the background and all windows
 local function wm_draw()
-	-- TODO: optimize, only repaint when necessary
-	--   e.g. repaint stacked windows over running window,
-	--   only full repaint on move/resize/close
-	
 	if draw_background then
 		term.setBackgroundColor(colors.lightBlue)
 		term.clear()
@@ -734,10 +774,14 @@ local function wm_mainloop()
 			break
 		end
 		wm_handle_event(evt)
+		while #event_queue > 0 do
+			local evt = table.remove(event_queue,#event_queue)
+			process_resume(evt[1],evt[2])
+		end
 	end
 end
 
--- Multishell extensions to provide proper windowing functionality to programs
+-- Multishell extensions to provide windowing functionality to programs
 multishell_ext.getFocus = function() return process_focus end
 multishell_ext.setFocus = function(n) process_set_focus(n) end
 multishell_ext.getTitle = function(n) return processes[n].getTitle() end
@@ -747,10 +791,10 @@ multishell_ext.getCount = function() return #processes end
 multishell_ext.launch = function(tProgramEnv, sProgramPath, ...)
 	return process_run(tProgramEnv, sProgramPath, {...})
 end
+-- TODO: Add more API functions to control window position, size, etc.
 
-
-process_run_command("logview")
---process_run_command(nil)
+--process_run_command("logview")
+process_run_command(nil)
 process_set_focus(1)
 --processes[1].border = false
 --process_reposition(1,5,5)

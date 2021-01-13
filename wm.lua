@@ -1,4 +1,4 @@
--- CCWM: graphical window manager for ComputerCraft
+-- wm.lua: graphical window manager for ComputerCraft
 
 -- Usage:
 --   Right-click the desktop to open the run menu.

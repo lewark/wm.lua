@@ -1,31 +1,106 @@
 -- wm.lua: graphical window manager for ComputerCraft
 
--- Usage:
---   Right-click the desktop to open the run menu.
---   Windows work as you'd expect: Drag the title bar of a window to move it,
---     and click the buttons to minimize, maximize, or close the window. Wowee.
---   Drag the lower-right corner a window to resize it.
---   Press Ctrl-Tab to switch windows. This can also restore minimized windows.
+--[[
+	Copyright (c) 2021 knector01
 
--- Notes for application development:
---   Events not emitted by the mouse or keyboard, such as timers or rednet
---     messages, are redirected by the WM to all running programs.
---   If your application uses timers, make sure to check IDs of received timer
---     events to avoid conflicts with other running applications' timers.
---   If your application is dependent on the window size, then you can listen
---     for term_resize events and adjust the UI accordingly.
---   Additionally, the WM provides a modified multishell API that allows
---     applications to open additional windows as needed. The API should work
---     seamlessly with existing multishell applications. shell.openTab
---     and related library functions also work.
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
 
---   The following events are emitted by the window manager:
---     wm_focus <focused>
---       emitted when a window gains or loses focus
---     wm_log <message>
---       internal debug messages from the WM
---     term_resize
---       emitted when a window is resized
+	The above copyright notice and this permission notice shall be included in all
+	copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+	SOFTWARE.
+--]]
+
+--[[
+	**About the WM**
+
+	Yeah, it's another one of these. I did try to make it pretty straightforward
+		to use, and it *should* work well with existing applications.
+	This program is a rewrite of a WM I wrote back in 2014. For this version I
+		switched to using the built-in CC window API for rendering, and I tried
+		my best to keep the code somewhat readable. I also added some features
+		like window maximization, a multishell API implementation, and a new
+		application launcher.
+
+	Usage:
+		Right-click the desktop to open the run menu.
+		Windows work as you'd expect: Drag the title bar of a window to move it,
+			and click the buttons to minimize, maximize, or close the window. Wowee.
+		Drag the lower-right corner a window to resize it.
+		Press Ctrl-Tab to switch windows. This can also restore minimized windows.
+
+	Notes for application development:
+		Events not emitted by the mouse or keyboard, such as timers or rednet
+			messages, are redirected by the WM to all running programs.
+		If your application uses timers, make sure to check IDs of received timer
+			events to avoid conflicts with other running applications' timers.
+		If your application is dependent on the window size, then you can listen
+			for term_resize events and adjust the UI accordingly.
+		Additionally, the WM provides a modified multishell API that allows
+			applications to open additional windows as needed. The API should work
+			seamlessly with existing multishell applications. shell.openTab
+			and related library functions also work.
+
+		The following events are emitted by the window manager:
+			wm_focus <focused>
+				emitted when a window gains or loses focus
+			wm_log <message>
+				internal debug messages from the WM
+			term_resize
+				emitted when a window is resized
+--]]
+
+-- Events which should be sent to the focused window
+local EVENTS_KEYBD = {"char","key","key_up","paste","terminate"}
+-- Events which have X/Y coordinates
+local EVENTS_MOUSE = {"mouse_click","mouse_up","mouse_scroll","mouse_drag"}
+-- Events which have X/Y coordinates and should only be sent to the window they are over
+local EVENTS_TOP = {"mouse_click","mouse_scroll"}
+-- Other events (rednet, timers, etc) are sent to all windows
+
+-- Minimum window size
+local MIN_WIDTH = 4
+local MIN_HEIGHT = 3
+
+-- Default window properties
+local DEFAULT_WIDTH = 20
+local DEFAULT_HEIGHT = 10
+local DEFAULT_X = 4
+local DEFAULT_Y = 3
+
+-- Enable to draw drop shadow under windows
+local SHADOW_ENABLE = false
+
+local DRAG_MOVE = 0
+local DRAG_RESIZE = 1
+
+local WM_COLORS = {
+	bg = colors.lightBlue,
+	shadow = colors.gray,
+	title_unfocused = colors.gray,
+	title_focused = colors.blue,
+	title_text = colors.white,
+	title_close = colors.red,
+	resize_bg = colors.white,
+	resize_fg = colors.lightGray,
+	menu = colors.white,
+	menu_text = colors.black,
+	menu_sel = colors.blue,
+	menu_sel_text = colors.white,
+	run = colors.white,
+	run_text = colors.black
+}
 
 local processes = {}
 local processes_visible = {}
@@ -33,27 +108,9 @@ local event_queue = {}
 local process_focus = 0
 local process_current = 0
 
--- Events which should be sent to the focused window
-local EVENTS_KEYBD = {"char","key","key_up","paste","terminate"}
--- Events which have XY coordinates and should be sent to the window they are over
-local EVENTS_MOUSE = {"mouse_click","mouse_up","mouse_scroll","mouse_drag"}
--- Other events (rednet, timers, etc) are sent to all windows
-
--- Minimum window size
-local MIN_WIDTH = 4
-local MIN_HEIGHT = 3
-
-local SHADOW_ENABLE = false
-
 local term_original = term.current()
 
-local default_width = 20
-local default_height = 10
-
 local drag_state
-
-DRAG_MOVE = 0
-DRAG_RESIZE = 1
 
 local draw_background = false
 
@@ -61,7 +118,8 @@ local control_held = false
 
 local multishell_ext = {}
 
--- BUG: textutils.pagedPrint seems broken, investigate
+-- BUG: textutils.pagedPrint seems broken under wm.lua, investigate
+-- for example, "set" command does not seem to scroll correctly
 
 local function queue_event(id, evt)
 	table.insert(event_queue, 1, {id, evt})
@@ -171,7 +229,12 @@ end
 
 local function wm_log(text) end
 
-local function process_resume(id, args)
+local function prompt_keypress()
+	term.write("Press any key")
+	os.pullEvent("key")
+end
+
+local function process_resume(id, args, initial)
 	local process = processes[id]
 	local current_run = process_current
 	
@@ -183,15 +246,20 @@ local function process_resume(id, args)
 	local status, ret = coroutine.resume(process.coroutine, unpack(args))
 	--if status then
 	process.filter = ret
-	--else
-	--	wm_log("end "..ret)
 	--end
 	--wm_log("process_resume "..tostring(id).." "..tostring(status).." "..tostring(ret))
 	
 	if coroutine.status(process.coroutine) == "dead" then --not status then --
-		process_end(id)
+		if initial then
+			-- prompt for keypress if program immediately exits
+			-- BUG: shows title of "shell" if this occurs
+			process.coroutine = coroutine.create(prompt_keypress)
+			queue_event(id,{})
+		else
+			process_end(id)
+		end
 	else
-		--wm_log("dirty in resume")
+		-- TODO: Only set dirty flag when application is drawn to
 		wm_dirty(id)
 	end
 	
@@ -219,14 +287,13 @@ local function process_create(func, title, x, y, w, h)
 	
 	local current_run = process_current
 	
-	--wm_log("process create")
 	table.insert(processes, process)
 	table.insert(processes_visible, #processes)
 	
-	process.x = x or 4
-	process.y = y or 4
-	process.w = w or default_width
-	process.h = h or default_height
+	process.x = x or DEFAULT_X
+	process.y = y or DEFAULT_Y
+	process.w = w or DEFAULT_WIDTH
+	process.h = h or DEFAULT_HEIGHT
 	process.visible = true
 	process.border = true
 	process.title = title
@@ -244,12 +311,9 @@ local function process_create(func, title, x, y, w, h)
 	
 	process_current = current_run
 	if process.coroutine then
-		--wm_dirty(#processes,true)
-		--wm_log("process resume")
-		
-		-- initial resume call must not be queued, the edit program's
+		-- initial resume call must not be queued; the edit program's
 		-- run button expects the process to immediately start
-		process_resume(#processes,{})
+		process_resume(#processes,{},true)
 	else
 		process_end(#processes)
 	end
@@ -272,8 +336,6 @@ local function process_run(env, path, args, title, x, y, w, h)
 		table.insert(run_args,args[i])
 	end
 	title = title or path
-	--wm_log("run_path "..path)
-	--wm_log("run_args "..table.concat(args," "))
 	
 	-- add a call to read() in the function to debug errors
 	return process_create(function() os.run(unpack(run_args)) end, title, x, y, w, h)
@@ -282,14 +344,12 @@ end
 -- runs a shell command inside a process,
 -- and lets the CraftOS shell set up the environment
 -- is this hacky? maybe. it does seem to work though.
+-- TODO: look into just using os.run
 -- if command is nil then an interactive shell is launched
 local function process_run_command(command, x, y, w, h)
 	-- not sure if i'm doing this right, honestly
 	-- seems to work though
-	
-	--if not env then
-	env = {shell=shell, multishell=multishell_ext} --table_copy(_G)
-	--end
+	env = {shell=shell, multishell=multishell_ext}
 	
 	process_run(env, shell.resolveProgram("shell"), {command}, command, x, y, w, h)
 end
@@ -317,7 +377,7 @@ local function process_reposition(id, x, y, w, h)
 	if resized then
 		queue_event(id, {"term_resize"})
 	end
-	--wm_draw()
+	
 	wm_dirty()
 end
 
@@ -362,8 +422,6 @@ local function process_set_maximized(id, maximized)
 end
 
 local function process_set_focus(id, top)
-	--wm_log("visible "..table.concat(processes_visible,","))
-	--wm_log("n "..#processes)
 	if process_focus > 0 and process_focus ~= id then
 		local old_focus = process_focus
 		process_focus = 0
@@ -405,7 +463,7 @@ local function process_draw(id)
 			process.window.redraw()
 		end
 		if SHADOW_ENABLE then
-			term.setBackgroundColor(colors.gray)
+			term.setBackgroundColor(WM_COLORS.shadow)
 			for i=1,process.w do
 				term.setCursorPos(process.x+i,process.y+process.h)
 				term.write(" ")
@@ -416,28 +474,28 @@ local function process_draw(id)
 			end
 		end
 		if process.border then
-			local title_color = colors.gray
+			local title_color = WM_COLORS.title_unfocused
 			if id == process_focus then
-				title_color = colors.blue
+				title_color = WM_COLORS.title_focused
 			end
 			
 			term.setBackgroundColor(title_color)
-			term.setTextColor(colors.white)
+			term.setTextColor(WM_COLORS.title_text)
 			term.setCursorPos(process.x, process.y)
 			term.write(str_pad(process.title,process.w-3))
 			
-			term.setBackgroundColor(colors.white)
+			term.setBackgroundColor(WM_COLORS.title_text)
 			term.setTextColor(title_color)
 			term.write(string.char(22,23))
 			
-			term.setBackgroundColor(colors.red)
-			term.setTextColor(colors.white)
+			term.setBackgroundColor(WM_COLORS.title_close)
+			term.setTextColor(WM_COLORS.title_text)
 			term.write("x")
 			
 			if not process.maximized then
 				term.setCursorPos(process.x+process.w-1,process.y+process.h-1)
-				term.setBackgroundColor(colors.white)
-				term.setTextColor(colors.lightGray)
+				term.setBackgroundColor(WM_COLORS.resize_bg)
+				term.setTextColor(WM_COLORS.resize_fg)
 				term.write(string.char(127))
 			end
 		end
@@ -446,7 +504,6 @@ local function process_draw(id)
 end
 
 local function show_menu(items)
-	--wm_log("enter show_menu")
 	local process = processes[process_current]
 	process_set_focus(process_current)
 	
@@ -454,12 +511,10 @@ local function show_menu(items)
 	local y = process.y
 	local w = 0
 	local h = #items
-	--wm_log("x:"..x..",y:"..y..",w:"..w..",h:"..h)
+	
 	for i=1,#items do
-		--wm_log("i:"..i)
 		w = math.max(w, #items[i])
 	end
-	--wm_log("x:"..x..",y:"..y..",w:"..w..",h:"..h)
 	
 	local tw, th = term_original.getSize()
 	
@@ -476,36 +531,35 @@ local function show_menu(items)
 	if x + w > tw then
 		x = - w + tw + 1
 	end
-	--wm_log("process "..tostring(process_current).." "..tostring(process))
+	
 	process.border = false
-	--process.x,process.y,process.w,process.h = x,y,w,h
-	--process.window.reposition(x,y,w,h)
 	process_reposition(process_current,x,y,w,h)
+	
 	local selected = 0
 	local scroll = 0
 	local scroll_min = 0
 	local scroll_max = #items-h
 	while true do
-		--wm_log("show_menu loop")
-		term.setBackgroundColor(colors.white)
-		term.setTextColor(colors.black)
+		term.setBackgroundColor(WM_COLORS.menu)
+		term.setTextColor(WM_COLORS.menu_text)
 		term.clear()
+		
 		for i=1,#items do
 			term.setCursorPos(1,i-scroll)
 			if selected == i then
-				term.setBackgroundColor(colors.blue)
-				term.setTextColor(colors.white)
+				term.setBackgroundColor(WM_COLORS.menu_sel)
+				term.setTextColor(WM_COLORS.menu_sel_text)
 				term.clearLine()
 			else
-				term.setBackgroundColor(colors.white)
-				term.setTextColor(colors.black)
+				term.setBackgroundColor(WM_COLORS.menu)
+				term.setTextColor(WM_COLORS.menu_text)
 			end
 			term.write(items[i])
 		end
+		
 		event = {os.pullEvent()}
+		
 		if event[1] == "key" then
-			--local key_name = "blah" --keys.getKey(event[2])
-			--wm_log("menu_key "..tostring(event[2]))
 			if event[2] == keys.up then
 				selected = math.max(selected-1, 1)
 			elseif event[2] == keys.down then
@@ -523,6 +577,7 @@ local function show_menu(items)
 		elseif event[1] == "wm_focus" and event[2] == 0 then
 			break
 		end
+		
 		local scroll_shift = 0
 		if selected == scroll + 1 then
 			scroll_shift = -1
@@ -542,27 +597,37 @@ local function show_run_menu()
 	local options = {"shell","programs...","run...","shutdown","restart"}
 	local process = processes[process_current]
 	local ret = {pcall(show_menu,options)}
-	--process_reposition(process_current,1,1,10,10)
+	
 	print(ret[1],ret[2])
 	if ret[1] then
 		if ret[2] == 1 then
 			process_run_command(nil,process.x,process.y)
 		elseif ret[2] == 2 then
 			local progs = shell.programs()
+			-- TODO: is pcall necessary here anymore?
 			local ret2 = {pcall(show_menu,progs)}
 			if ret2[1] and ret2[2] > 0 then
-				--print(ret2[3])
 				process_run_command(progs[ret2[2]],process.x,process.y)
 			end
 		elseif ret[2] == 3 then
 			process.border = true
-			process_reposition(process_current,process.x,process.y,20,4)
+			local x = process.x
+			local w = 20
+			local tw, th = term_original.getSize()
+			
+			if x + w - 1 > tw then
+				x = tw - w + 1
+			end
+			
+			process_reposition(process_current,x,process.y,w,4)
 			process_set_title(process_current,"run")
-			term.setBackgroundColor(colors.black)
-			term.setTextColor(colors.white)
+			
+			term.setBackgroundColor(WM_COLORS.run)
+			term.setTextColor(WM_COLORS.run_text)
 			term.setCursorPos(2,2)
 			term.clear()
 			term.write("run> ")
+			
 			local cmd = read(nil,nil,shell.complete)
 			if cmd then
 				process_run_command(cmd,process.x,process.y)
@@ -573,7 +638,6 @@ local function show_run_menu()
 			os.reboot()
 		end
 	end
-	--read()
 end
 
 -- return true to block click event from the process
@@ -610,6 +674,14 @@ local function wm_handle_window_click(id, event)
 	return false
 end
 
+local function wm_send_mouse_event(id,event)
+	local x,y,w,h = process_subwindow_properties(id)
+	local proc_event = table_copy(event)
+	proc_event[3] = math.min(math.max(proc_event[3] - x + 1,1),w)
+	proc_event[4] = math.min(math.max(proc_event[4] - y + 1,1),h)
+	queue_event(id,proc_event)
+end
+
 local function wm_handle_mouse_event(event)	
 	if drag_state then
 		if event[1] == "mouse_up" then
@@ -635,62 +707,52 @@ local function wm_handle_mouse_event(event)
 		end
 		return
 	end
-	
-	local hit_window = false
-	for i=#processes_visible,1,-1 do
-		local id = processes_visible[i]
-		local process = processes[id]
-		--term.setTextColor(colors.black)
-		--print(process.x)
-		-- event within window borders?
-		
-		if (process.visible and
-			event[3] >= process.x and 
-			event[4] >= process.y and 
-			event[3] < process.x+process.w and
-			event[4] < process.y+process.h) then
+	if contains(EVENTS_TOP,event[1]) then
+		local hit_window = false
+		for i=#processes_visible,1,-1 do
+			local id = processes_visible[i]
+			local process = processes[id]
+			-- event within window borders?
 			
-			hit_window = true
-			local x,y,w,h = process_subwindow_properties(id)
-			
-			local skip = false
-			
-			if event[1] == "mouse_click" then
-				process_set_focus(id,true)
-				skip = wm_handle_window_click(id, event)
-				--if skip then wm_log("skipped") end
-			end
-			
-			-- event within window contents?
-			if ((not skip) and
-				event[3] >= x and 
-				event[4] >= y and 
-				event[3] < x+w and
-				event[4] < y+h) then
+			if (process.visible and
+				event[3] >= process.x and 
+				event[4] >= process.y and 
+				event[3] < process.x+process.w and
+				event[4] < process.y+process.h) then
 				
-				local proc_event = table_copy(event)
-				proc_event[3] = proc_event[3] - x + 1
-				proc_event[4] = proc_event[4] - y + 1
-				queue_event(id,proc_event)
+				hit_window = true
+				local x,y,w,h = process_subwindow_properties(id)
+				
+				local skip = false
+				
+				if event[1] == "mouse_click" then
+					process_set_focus(id,true)
+					skip = wm_handle_window_click(id, event)
+				end
+				
+				-- event within window contents?
+				if ((not skip) and
+					event[3] >= x and 
+					event[4] >= y and 
+					event[3] < x+w and
+					event[4] < y+h) then
+					
+					wm_send_mouse_event(id,event)
+				end
+				
+				break
 			end
-			
-			break
 		end
-	end
-	if (not hit_window) and event[1] == "mouse_click" then
-		--wm_log("desktop clicked")
-		if event[2] == 2 then
-			--process_run_command(nil,event[3],event[4])
-			local options = {}
-			for i=1,30 do
-				table.insert(options, "Option "..i)
+		if (not hit_window) and event[1] == "mouse_click" then
+			if event[2] == 2 then
+				process_create(show_run_menu, "menu", event[3], event[4])
+			elseif process_focus > 0 then
+				process_set_focus(0)
 			end
-			--term.setCursorPos(1,1)
-			--print(options)
-			process_create(show_run_menu, "menu", event[3], event[4])
-			--wm_dirty()
-		elseif process_focus > 0 then
-			process_set_focus(0)
+		end
+	else
+		if process_focus > 0 then
+			wm_send_mouse_event(process_focus,event)
 		end
 	end
 end
@@ -699,8 +761,6 @@ local function wm_handle_event(event)
 	local is_mouse = contains(EVENTS_MOUSE,event[1])
 	local is_keybd = contains(EVENTS_KEYBD,event[1])
 	
-	-- this is only needed if running a copy of the WM inside itself
-	-- doing such a thing is so unbelievably silly that i had no choice but to support it
 	if event[1] == "term_resize" then
 		w,h = term.getSize()
 		for i=1,#processes do
@@ -747,7 +807,7 @@ end
 -- draw the background and all windows
 local function wm_draw()
 	if draw_background then
-		term.setBackgroundColor(colors.lightBlue)
+		term.setBackgroundColor(WM_COLORS.bg)
 		term.clear()
 		draw_background = false
 	end
@@ -760,12 +820,9 @@ local function wm_draw()
 	else
 		term.setCursorBlink(false)
 	end
-	term.setBackgroundColor(colors.black)
-	term.setTextColor(colors.white)
 end
 
 local function wm_mainloop()
-	--process_create()
 	wm_dirty()
 	while true do
 		wm_draw()
@@ -793,13 +850,13 @@ multishell_ext.launch = function(tProgramEnv, sProgramPath, ...)
 end
 -- TODO: Add more API functions to control window position, size, etc.
 
---process_run_command("logview")
+-- run a shell window
 process_run_command(nil)
 process_set_focus(1)
---processes[1].border = false
---process_reposition(1,5,5)
+
 wm_mainloop()
 
+-- cleanup
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
 term.clear()

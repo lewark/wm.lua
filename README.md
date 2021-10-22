@@ -1,3 +1,5 @@
+![alt text](https://github.com/knector01/wm.lua/blob/master/wm-screenshot.png?raw=true)
+
 # wm.lua
 
 Yeah, it's another one of these. I did try to make it pretty straightforward to use, and it *should* work well with existing applications.
@@ -8,7 +10,7 @@ This program is a rewrite of a WM I wrote back in 2014. For this version I switc
 * multishell API implementation
 * new application launcher
 
-# Installation
+## Installation
 
 To install the WM on a ComputerCraft computer, run the following command:
 
@@ -16,13 +18,13 @@ To install the WM on a ComputerCraft computer, run the following command:
 
 Then run `wm.lua` to start the window manager. You can rename the file to `startup.lua` to make it run on startup.
 
-# Usage
+## Usage
 
 Right-click the desktop to open the application launcher. Note that CC applications like `edit` or `paint` require additional command-line arguments and should be launched through the "Run..." menu or a shell window.
 
 Windows work as you'd expect: Drag the title bar of a window to move it, and click the buttons to minimize, maximize, or close the window. Drag the lower-right corner a window to resize it. Press Ctrl-Tab to switch windows. This can also restore minimized windows.
 
-# Notes for application development
+## Notes for application development
 
 * Events not emitted by the mouse or keyboard, such as timers or rednet messages, are redirected by the WM to all running programs.
 * If your application uses timers, make sure to check IDs of received timer events to avoid conflicts with other running applications' timers.

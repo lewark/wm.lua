@@ -2,8 +2,6 @@
 
 # wm.lua
 
-Yeah, it's another one of these. I did try to make it pretty straightforward to use, and it *should* work well with existing applications.
-
 This program is a rewrite of a WM I wrote back in 2014. For this version I switched to using the built-in CC window API for rendering, and I tried my best to keep the code somewhat readable. I also added some features:
 
 * window maximization
